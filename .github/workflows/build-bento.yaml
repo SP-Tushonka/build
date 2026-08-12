@@ -22,6 +22,7 @@ concurrency:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   build:
@@ -126,12 +127,25 @@ jobs:
             echo "runtime_folder=$(jq -r '.release.runtimeFolderName' "$MANIFEST")"
           } >> $GITHUB_OUTPUT
 
+      - name: NuGet Login
+        id: nuget-login
+        continue-on-error: true
+        uses: NuGet/login@v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Publish NuGet Packages
         continue-on-error: true
         shell: bash
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NuGet login produced no key; nothing was published. Check the trusted publishing policy on nuget.org covers ${{ github.repository }} / $(basename "$GITHUB_WORKFLOW_REF" | cut -d@ -f1)."
+            echo "NuGet: login failed, no packages published." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           # Bento packs the server libraries but never pushes them. Publish only the packages Bento curated in the
           # manifest, not every .nupkg in the directory.
           MANIFEST="${{ steps.bento.outputs.output_dir }}/manifest.json"
@@ -149,6 +163,7 @@ jobs:
             exit 0
           fi
 
+          FAILED=()
           for PACKAGE in "${PACKAGES[@]}"; do
             PACKAGE_FILE="$PKG_DIR/${PACKAGE}.${VERSION}.nupkg"
             if [ -f "$PACKAGE_FILE" ]; then
@@ -156,13 +171,20 @@ jobs:
               if dotnet nuget push "$PACKAGE_FILE" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate; then
                 echo "Successfully published $PACKAGE"
               else
-                echo "Failed to publish $PACKAGE"
+                echo "::error::Failed to publish ${PACKAGE}.${VERSION}."
+                FAILED+=("$PACKAGE")
               fi
             else
-              echo "Warning: $PACKAGE_FILE not found, skipping."
+              echo "::error::${PACKAGE}.${VERSION}.nupkg was listed in the manifest but not produced."
+              FAILED+=("$PACKAGE")
             fi
           done
-          echo "NuGet package publishing completed."
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "NuGet: ${#FAILED[@]} of ${#PACKAGES[@]} packages failed to publish (${FAILED[*]})." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "NuGet: published ${#PACKAGES[@]} packages at ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Build Release Manifest
         # Merges this build into the live release.json rather than replacing it. The installer keys one entry per
