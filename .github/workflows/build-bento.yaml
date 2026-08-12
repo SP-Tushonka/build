@@ -186,6 +186,38 @@ jobs:
             echo "NuGet: published ${#PACKAGES[@]} packages at ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Configure SSH Key
+        id: ssh
+        shell: bash
+        env:
+          SFTP_PRIVATE_KEY: ${{ secrets.SFTP_PRIVATE_KEY }}
+          SFTP_KNOWN_HOSTS: ${{ secrets.SFTP_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          SSH_DIR="$RUNNER_TEMP/ssh"
+          install -d -m 700 "$SSH_DIR"
+
+          if [ -z "${SFTP_PRIVATE_KEY:-}" ]; then
+            echo "::error::SFTP_PRIVATE_KEY is not set."
+            exit 1
+          fi
+
+          printf '%s\n' "$SFTP_PRIVATE_KEY" > "$SSH_DIR/id_release"
+          chmod 600 "$SSH_DIR/id_release"
+
+          if [ -n "${SFTP_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$SFTP_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
+            chmod 644 "$SSH_DIR/known_hosts"
+            echo "host_check=yes" >> "$GITHUB_OUTPUT"
+          else
+            : > "$SSH_DIR/known_hosts"
+            echo "::warning::SFTP_KNOWN_HOSTS is not set; the mirror's host key is being accepted unverified. Populate it with: ssh-keyscan -p <port> <host>"
+            echo "host_check=accept-new" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "ssh_dir=$SSH_DIR" >> "$GITHUB_OUTPUT"
+
       - name: Build Release Manifest
         # Merges this build into the live release.json rather than replacing it. The installer keys one entry per
         # major.minor channel, so publishing 4.1.3 must replace the "4.1" entry and leave every other channel alone.
@@ -287,8 +319,9 @@ jobs:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
           SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
-          SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
           SFTP_RELEASE_PATH: ${{ secrets.SFTP_RELEASE_PATH }}
+          SSH_DIR: ${{ steps.ssh.outputs.ssh_dir }}
+          HOST_CHECK: ${{ steps.ssh.outputs.host_check }}
         shell: bash
         run: |
           set -euo pipefail
@@ -302,18 +335,25 @@ jobs:
           endpoint = '"$R2_ENDPOINT"'
           acl = public-read' > ./rclone.conf
 
-          ssh_opts=(-o "Port=${SFTP_PORT}" -o "ConnectTimeout=20" -o "StrictHostKeyChecking=no")
+          ssh_opts=(
+            -i "$SSH_DIR/id_release"
+            -o "IdentitiesOnly=yes"
+            -o "UserKnownHostsFile=$SSH_DIR/known_hosts"
+            -o "StrictHostKeyChecking=$HOST_CHECK"
+            -o "Port=${SFTP_PORT}"
+            -o "ConnectTimeout=20"
+          )
 
           echo "== Uploading archive to R2 =="
           rclone copy "./${BUILD_NAME}" "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf -vv
 
           echo "== Uploading archive to the VPS mirror =="
-          sshpass -p "$SFTP_PASSWORD" scp "${ssh_opts[@]}" "./${BUILD_NAME}" \
+          scp "${ssh_opts[@]}" "./${BUILD_NAME}" \
             "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/releases/"
 
           echo "== Publishing release.json to both hosts =="
           rclone copy "./release.json" "r2:${R2_BUCKET_NAME}/" --config ./rclone.conf -vv
-          sshpass -p "$SFTP_PASSWORD" scp "${ssh_opts[@]}" "./release.json" \
+          scp "${ssh_opts[@]}" "./release.json" \
             "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/release.json"
 
           echo "== Pruning superseded ${CHANNEL} archives =="
@@ -327,7 +367,7 @@ jobs:
             echo "Nothing stale in R2."
           fi
 
-          sshpass -p "$SFTP_PASSWORD" ssh "${ssh_opts[@]}" "${SFTP_USERNAME}@${SFTP_HOST}" \
+          ssh "${ssh_opts[@]}" "${SFTP_USERNAME}@${SFTP_HOST}" \
             "find '${SFTP_RELEASE_PATH}/releases' -maxdepth 1 -name 'SPT-${CHANNEL}.*.7z' ! -name '${BUILD_NAME}' -print -delete"
 
           echo "Release published to both hosts."
@@ -336,10 +376,28 @@ jobs:
         id: upload-https-7z
         working-directory: ${{ steps.bento.outputs.output_dir }}
         shell: bash
+        env:
+          BUILD_NAME: ${{ steps.manifest.outputs.build_name }}
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
+          SFTP_RELEASE_PATH: ${{ secrets.SFTP_RELEASE_PATH }}
+          MIRROR_BASE: ${{ secrets.RELEASE_MIRROR_BASE }}
+          SSH_DIR: ${{ steps.ssh.outputs.ssh_dir }}
+          HOST_CHECK: ${{ steps.ssh.outputs.host_check }}
         run: |
-          sshpass -p "${{ secrets.SFTP_PASSWORD }}" scp -v -o "Port=${{ secrets.SFTP_PORT }}" -o "ConnectTimeout=20" -o "StrictHostKeyChecking=no" "${{ steps.manifest.outputs.build_name }}" ${{ secrets.SFTP_USERNAME }}@${{ secrets.SFTP_HOST }}:/public/builds
-          echo "link_https=${{ secrets.SFTP_MIRROR_LINK }}/builds/${{ steps.manifest.outputs.build_name }}" >> $GITHUB_OUTPUT
-          echo "HTTPS Upload completed: ${{ secrets.SFTP_MIRROR_LINK }}/builds/${{ steps.manifest.outputs.build_name }}"
+          set -euo pipefail
+          scp -v \
+            -i "$SSH_DIR/id_release" \
+            -o "IdentitiesOnly=yes" \
+            -o "UserKnownHostsFile=$SSH_DIR/known_hosts" \
+            -o "StrictHostKeyChecking=$HOST_CHECK" \
+            -o "Port=${SFTP_PORT}" \
+            -o "ConnectTimeout=20" \
+            "$BUILD_NAME" "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/builds/"
+
+          echo "link_https=${MIRROR_BASE}/builds/${BUILD_NAME}" >> $GITHUB_OUTPUT
+          echo "HTTPS Upload completed: ${MIRROR_BASE}/builds/${BUILD_NAME}"
 
       - name: Post Build Info to Discord
         env:
