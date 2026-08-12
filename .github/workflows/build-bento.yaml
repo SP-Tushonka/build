@@ -15,8 +15,10 @@ on:
         type: string
 
 concurrency:
-  group: spt-release-build-bento
-  cancel-in-progress: true
+  # Per-tag, and never cancelled: publishing writes two hosts independently, so a build killed part-way through can
+  # leave patcher and mirror serving different release.json files.
+  group: spt-release-build-bento-${{ github.event.inputs.buildTag }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -26,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # The image produced by Bento's release.yml.
-      image: ghcr.io/sp-tarkov/bento:latest
+      image: ghcr.io/sp-tushonka/bento:latest
     steps:
       - name: Determine Build Context
         id: determine-context
@@ -120,6 +122,8 @@ jobs:
             echo "base_name=${ARCHIVE_NAME%.7z}"
             echo "file_size_mb=$(jq -r '.archive.sizeDisplay' "$MANIFEST")"
             echo "file_hash=$(jq -r '.archive.md5Base64' "$MANIFEST")"
+            echo "channel=$(jq -r '.release.channel' "$MANIFEST")"
+            echo "runtime_folder=$(jq -r '.release.runtimeFolderName' "$MANIFEST")"
           } >> $GITHUB_OUTPUT
 
       - name: Publish NuGet Packages
@@ -160,25 +164,113 @@ jobs:
           done
           echo "NuGet package publishing completed."
 
-      - name: R2 Upload
+      - name: Build Release Manifest
+        # Merges this build into the live release.json rather than replacing it. The installer keys one entry per
+        # major.minor channel, so publishing 4.1.3 must replace the "4.1" entry and leave every other channel alone.
+        if: steps.manifest.outputs.build_type == 'RELEASE'
+        id: release-json
+        working-directory: ${{ steps.bento.outputs.output_dir }}
+        env:
+          CHANNEL: ${{ steps.manifest.outputs.channel }}
+          CLIENT_VERSION: ${{ steps.manifest.outputs.client_version }}
+          RUNTIME_FOLDER: ${{ steps.manifest.outputs.runtime_folder }}
+          FILE_HASH: ${{ steps.manifest.outputs.file_hash }}
+          BUILD_NAME: ${{ steps.manifest.outputs.build_name }}
+          PRIMARY_BASE: ${{ secrets.RELEASE_PRIMARY_BASE }}
+          MIRROR_BASE: ${{ secrets.RELEASE_MIRROR_BASE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Read the live file before touching anything. Publishing a fresh single-entry file would silently drop
+          # every other channel, so a fetch failure has to stop the release rather than fall back to an empty list.
+          if ! curl -fsSL --retry 3 "${PRIMARY_BASE}/release.json" -o current.json; then
+            echo "::warning::Could not read release.json from the primary host, trying the mirror."
+            if ! curl -fsSL --retry 3 "${MIRROR_BASE}/release.json" -o current.json; then
+              echo "::error::Could not read the live release.json from either host. Refusing to publish, as writing a new file here would drop the other release channels."
+              exit 1
+            fi
+          fi
+
+          if ! jq -e '.Releases | type == "array"' current.json > /dev/null; then
+            echo "::error::The live release.json has no Releases array. Refusing to publish."
+            exit 1
+          fi
+
+          BEFORE=$(jq '.Releases | length' current.json)
+          echo "Live release.json holds $BEFORE channel(s): $(jq -r '[.Releases[].SPTVersion] | join(", ")' current.json)"
+
+          MIRRORS=$(jq -n \
+            --arg main "${PRIMARY_BASE}/releases/${BUILD_NAME}" \
+            --arg mirror "${MIRROR_BASE}/releases/${BUILD_NAME}" \
+            --arg hash "$FILE_HASH" \
+            '[{Name: "Main", DownloadUrl: $main, Hash: $hash}, {Name: "Mirror", DownloadUrl: $mirror, Hash: $hash}]')
+
+          # RequiredRuntimes is curated policy that changes without a rebuild, so it carries over from the channel's
+          # existing entry instead of being restated here.
+          jq \
+            --arg channel "$CHANNEL" \
+            --arg clientVersion "$CLIENT_VERSION" \
+            --arg runtimeFolder "$RUNTIME_FOLDER" \
+            --argjson mirrors "$MIRRORS" \
+            '
+            .Releases as $releases
+            | ($releases | map(select(.SPTVersion == $channel)) | first) as $existing
+            | {
+                SPTVersion: $channel,
+                ClientVersion: $clientVersion,
+                RuntimeFolderName: $runtimeFolder,
+                RequiredRuntimes: ($existing.RequiredRuntimes // []),
+                Mirrors: $mirrors
+              } as $entry
+            | {
+                Releases: (
+                  if $existing
+                  then ($releases | map(if .SPTVersion == $channel then $entry else . end))
+                  else ([$entry] + $releases)
+                  end
+                )
+              }
+            ' current.json > release.json
+
+          if [ "$(jq '.Releases | length' release.json)" -lt "$BEFORE" ]; then
+            echo "::error::The merge lost a release channel. Refusing to publish."
+            exit 1
+          fi
+
+          if [ "$(jq --arg c "$CHANNEL" '.Releases[] | select(.SPTVersion == $c) | .RequiredRuntimes | length' release.json)" -eq 0 ]; then
+            echo "::error::Channel ${CHANNEL} has no RequiredRuntimes. A new channel needs its runtime requirements seeded in the live release.json before the first automated publish."
+            exit 1
+          fi
+
+          echo "Merged release.json:"
+          cat release.json
+
+      - name: Publish Release to Mirrors
         # NOTE: This step is LIVE for release builds. Bento's manifest reports the build type in all-caps, so a plain
-        # semver tag produces 'RELEASE' and runs this step, WHICH DELETES THE EXISTING RELEASE FROM THE R2 BUCKET AND
-        # PUSHES THE NEW BUILD TO THE LIVE LAUNCHER. Bleeding edge and debug builds never match and are unaffected.
+        # semver tag produces 'RELEASE' and runs this step, WHICH PUSHES THE NEW BUILD TO THE LIVE INSTALLER. Bleeding
+        # edge and debug builds never match and are unaffected.
+        #
+        # Both hosts are written independently, archives first, so release.json never points at a file that is not
+        # there yet. Stale archives for this channel are pruned last, once the new entry is live.
         if: steps.manifest.outputs.build_type == 'RELEASE'
         working-directory: ${{ steps.bento.outputs.output_dir }}
         env:
-          SPT_VERSION: ${{ steps.manifest.outputs.spt_version }}
-          CLIENT_VERSION: ${{ steps.manifest.outputs.client_version }}
-          FILE_HASH: ${{ steps.manifest.outputs.file_hash }}
+          CHANNEL: ${{ steps.manifest.outputs.channel }}
           BUILD_NAME: ${{ steps.manifest.outputs.build_name }}
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          R2_FRONT: ${{ secrets.R2_FRONT }}
+          SFTP_HOST: ${{ secrets.SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.SFTP_PORT }}
+          SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
+          SFTP_PASSWORD: ${{ secrets.SFTP_PASSWORD }}
+          SFTP_RELEASE_PATH: ${{ secrets.SFTP_RELEASE_PATH }}
         shell: bash
         run: |
-          # Configure Rclone
+          set -euo pipefail
+
           echo '[r2]
           type = s3
           provider = Cloudflare
@@ -188,35 +280,35 @@ jobs:
           endpoint = '"$R2_ENDPOINT"'
           acl = public-read' > ./rclone.conf
 
-          # Generate Release JSON File
-          echo "{
-            \"AkiVersion\": \"${SPT_VERSION}\",
-            \"ClientVersion\": \"${CLIENT_VERSION}\",
-            \"Mirrors\": [{
-              \"DownloadUrl\": \"${R2_FRONT}/${BUILD_NAME}\",
-              \"Hash\": \"${FILE_HASH}\"
-            }]
-          }" > ./release.json
+          ssh_opts=(-o "Port=${SFTP_PORT}" -o "ConnectTimeout=20" -o "StrictHostKeyChecking=no")
 
-          echo "Current Local Directory:"
-          ls -lah
+          echo "== Uploading archive to R2 =="
+          rclone copy "./${BUILD_NAME}" "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf -vv
 
-          echo "Current Remote Directory:"
-          rclone ls r2:${R2_BUCKET_NAME} --config ./rclone.conf
+          echo "== Uploading archive to the VPS mirror =="
+          sshpass -p "$SFTP_PASSWORD" scp "${ssh_opts[@]}" "./${BUILD_NAME}" \
+            "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/releases/"
 
-          # Remove old .7z files from the bucket
-          rclone lsf r2:${R2_BUCKET_NAME} --config ./rclone.conf --files-only --include="*.7z" --absolute > files-to-remove.txt
-          echo "Files to be deleted:"
-          cat files-to-remove.txt
-          rclone delete r2:${R2_BUCKET_NAME} --config ./rclone.conf --files-from=files-to-remove.txt --max-depth=1 -vv
+          echo "== Publishing release.json to both hosts =="
+          rclone copy "./release.json" "r2:${R2_BUCKET_NAME}/" --config ./rclone.conf -vv
+          sshpass -p "$SFTP_PASSWORD" scp "${ssh_opts[@]}" "./release.json" \
+            "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/release.json"
 
-          # Upload the .7z file using rclone with the above config
-          rclone copy "./${BUILD_NAME}" r2:${R2_BUCKET_NAME} --config ./rclone.conf -vv
+          echo "== Pruning superseded ${CHANNEL} archives =="
+          rclone lsf "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf --files-only --include "SPT-${CHANNEL}.*.7z" \
+            | grep -vFx "${BUILD_NAME}" > stale.txt || true
+          if [ -s stale.txt ]; then
+            echo "Removing from R2:"
+            cat stale.txt
+            rclone delete "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf --files-from=stale.txt --max-depth 1 -vv
+          else
+            echo "Nothing stale in R2."
+          fi
 
-          # Upload the JSON file using rclone with the above config
-          rclone copy "./release.json" r2:${R2_BUCKET_NAME} --config ./rclone.conf -vv
+          sshpass -p "$SFTP_PASSWORD" ssh "${ssh_opts[@]}" "${SFTP_USERNAME}@${SFTP_HOST}" \
+            "find '${SFTP_RELEASE_PATH}/releases' -maxdepth 1 -name 'SPT-${CHANNEL}.*.7z' ! -name '${BUILD_NAME}' -print -delete"
 
-          echo "R2 Upload completed."
+          echo "Release published to both hosts."
 
       - name: Upload Release to HTTPS Source
         id: upload-https-7z
