@@ -30,6 +30,7 @@ jobs:
     container:
       # The image produced by Bento's release.yml.
       image: ghcr.io/sp-tushonka/bento:latest
+      options: --dns 1.1.1.1 --dns 8.8.8.8
     steps:
       - name: Determine Build Context
         id: determine-context
@@ -343,6 +344,14 @@ jobs:
             -o "Port=${SFTP_PORT}"
             -o "ConnectTimeout=20"
           )
+
+          r2_host=$(printf '%s' "$R2_ENDPOINT" | sed -E 's#^https?://##; s#/.*##')
+          if ! getent hosts "$r2_host" > /dev/null; then
+            echo "::error::Cannot resolve the R2 endpoint host from this container. resolv.conf:"
+            cat /etc/resolv.conf
+            getent hosts cloudflare.com > /dev/null               && echo "::error::General DNS works, so R2_ENDPOINT is malformed."               || echo "::error::No DNS at all in this container; check the container's --dns options."
+            exit 1
+          fi
 
           echo "== Uploading archive to R2 =="
           rclone copy "./${BUILD_NAME}" "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf -vv
