@@ -333,7 +333,7 @@ jobs:
           secret_access_key = '"$R2_SECRET_ACCESS_KEY"'
           region = auto
           endpoint = '"$R2_ENDPOINT"'
-          acl = public-read' > ./rclone.conf
+          no_check_bucket = true' > ./rclone.conf
 
           ssh_opts=(
             -i "$SSH_DIR/id_release"
