@@ -25,33 +25,23 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  context:
     runs-on: ubuntu-latest
-    container:
-      # The image produced by Bento's release.yml.
-      image: ghcr.io/sp-tushonka/bento:latest
+    outputs:
+      target_tag: ${{ steps.guard.outputs.target_tag }}
+      il2cpp: ${{ steps.guard.outputs.il2cpp }}
     steps:
-      - name: Determine Build Context
-        id: determine-context
-        shell: bash
-        run: |
-          echo "Determining build context..."
-
-          TAG_NAME="${{ github.event.inputs.buildTag }}"
-          if [[ -z "$TAG_NAME" ]]; then
-            echo "No build tag provided."
-            exit 1
-          fi
-
-          echo "target_tag=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "Target tag is $TAG_NAME"
-
       - name: Guard SPT Version
         id: guard
         shell: bash
         env:
-          TARGET_TAG: ${{ steps.determine-context.outputs.target_tag }}
+          TARGET_TAG: ${{ github.event.inputs.buildTag }}
         run: |
+          if [[ -z "$TARGET_TAG" ]]; then
+            echo "::error::No build tag provided."
+            exit 1
+          fi
+
           # Derive the SPT version the same way Bento does: strip a leading v/V, then take the prefix up to the first
           # dash (drops -BE / -BEM / date suffixes).
           VERSION="${TARGET_TAG#[vV]}"
@@ -79,6 +69,67 @@ jobs:
 
           echo "Accepted SPT version $VERSION (4.1+)."
 
+          echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
+          if (( MAJOR >= 5 )); then
+            echo "il2cpp=true" >> $GITHUB_OUTPUT
+          else
+            echo "il2cpp=false" >> $GITHUB_OUTPUT
+          fi
+
+  loader:
+    needs: context
+    if: needs.context.outputs.il2cpp == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Loader
+        uses: actions/checkout@v7
+        with:
+          repository: SP-Tushonka/IL2CPP-Loader
+          ref: ${{ needs.context.outputs.target_tag }}
+          token: ${{ secrets.LOADER_REPO_TOKEN }}
+
+      - name: Check Loader Port
+        shell: pwsh
+        env:
+          TARGET_TAG: ${{ needs.context.outputs.target_tag }}
+        run: |
+          $core = Invoke-RestMethod "https://raw.githubusercontent.com/SP-Tushonka/server-csharp/$env:TARGET_TAG/Libraries/SPTushonka.Server.Assets/SPT_Data/configs/core.json"
+          $client = $core.compatibleTarkovVersion
+          if (-not $client -or -not (Select-String -Path dll/proxy.cpp -SimpleMatch $client -Quiet)) {
+            Write-Output "::error::The loader at $env:TARGET_TAG is not ported to the server's client '$client'."
+            exit 1
+          }
+
+      - name: Set Up MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build version.dll
+        shell: pwsh
+        run: msbuild proxy.vcxproj /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$PWD\" /nologo /v:minimal
+
+      - name: Upload version.dll
+        uses: actions/upload-artifact@v7
+        with:
+          name: version-dll
+          path: build/version.dll
+          if-no-files-found: error
+
+  build:
+    needs: [context, loader]
+    # Mono (4.x) builds skip the loader as it's not needed on that build
+    if: always() && needs.context.result == 'success' && (needs.loader.result == 'success' || needs.loader.result == 'skipped')
+    runs-on: ubuntu-latest
+    container:
+      # The image produced by Bento's release.yml.
+      image: ghcr.io/sp-tushonka/bento:latest
+    steps:
+      - name: Download version.dll
+        if: needs.context.outputs.il2cpp == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: version-dll
+          path: loader
+
       - name: Build with Bento
         id: bento
         shell: bash
@@ -88,11 +139,15 @@ jobs:
           OUTPUT_DIR="$GITHUB_WORKSPACE/dist"
           rm -rf "$OUTPUT_DIR"
 
+          if [[ -f "$GITHUB_WORKSPACE/loader/version.dll" ]]; then
+            export VERSION_DLL="$GITHUB_WORKSPACE/loader/version.dll"
+          fi
+
           # Use the `--fresh` option to clone server-csharp, modules, and launcher at the tag and build them. Version
           # and build type are derived from the tag. Using the `--no-config` option keeps it fully-flagged.
           /opt/bento/bento \
             --fresh \
-            --tag "${{ steps.determine-context.outputs.target_tag }}" \
+            --tag "${{ needs.context.outputs.target_tag }}" \
             --output "$OUTPUT_DIR" \
             --no-config
 
