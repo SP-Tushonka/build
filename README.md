@@ -32,23 +32,12 @@ You can add a label to the end of `-BE` and `-BEM` tags to mark a specific build
 
 ## Running a build
 
-Builds are started by hand from the GitHub Actions tab using **workflow_dispatch**. Enter the tag to build in the `buildTag` field. Pick the right workflow for the version:
-
-- `build-4.0.yaml` - SPT 4.0.x
-- `build-bento.yaml` - SPT 4.1.x and newer
+Builds are started by hand from the GitHub Actions tab using **workflow_dispatch**. Enter the tag to build in the `buildTag` field of `build-bento.yaml`. It covers SPT 4.0.x and newer.
 
 ## Modules secret
 
 The modules build needs a file from a private repo. The link to it is stored in a secret named `MODULE_DOMAIN`. Without that secret the modules can't be downloaded and the build fails.
 
-## Docker image (4.0.x only)
+## Docker image
 
-The 4.0.x builds run inside the `refringe/spt-build-dotnet` image, built from `Dockerfile.build-4.0` in this repo.
-
-Before building a new image, bump the version number to something new.
-
-```
-# Build and push the spt-build-dotnet image to Docker Hub
-docker build -t refringe/spt-build-dotnet:2.2.0 -t refringe/spt-build-dotnet:latest -f Dockerfile.build-4.0 . --platform linux/amd64
-docker push refringe/spt-build-dotnet --all-tags
-```
+The build runs inside `ghcr.io/sp-tushonka/bento`, published by Bento's own release workflow. To pick up Bento changes, tag a release there and update the image reference in `build-bento.yaml`.

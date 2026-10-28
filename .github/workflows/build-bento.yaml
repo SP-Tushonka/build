@@ -57,17 +57,13 @@ jobs:
           REST="${VERSION#*.}"
           MINOR=$((10#${REST%%.*}))
 
-          # This workflow builds SPT 4.1.x and later. Reject everything else.
-          if (( MAJOR < 4 )); then
-            echo "::error::SPT $VERSION (3.x) is no longer built by this repository."
-            exit 1
-          fi
-          if (( MAJOR == 4 && MINOR < 1 )); then
-            echo "::error::SPT $VERSION is a 4.0.x build. Build it with build-4.0.yaml."
+          # Bento builds 3.9 and later. Anything older predates the pipeline.
+          if (( MAJOR < 3 || ( MAJOR == 3 && MINOR < 9 ) )); then
+            echo "::error::SPT $VERSION is older than 3.9 and is not built by this workflow."
             exit 1
           fi
 
-          echo "Accepted SPT version $VERSION (4.1+)."
+          echo "Accepted SPT version $VERSION."
 
           echo "target_tag=$TARGET_TAG" >> $GITHUB_OUTPUT
           if (( MAJOR >= 5 )); then
