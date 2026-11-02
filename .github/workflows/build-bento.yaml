@@ -311,8 +311,8 @@ jobs:
             --arg hash "$FILE_HASH" \
             '[{Name: "Main", DownloadUrl: $main, Hash: $hash}, {Name: "Mirror", DownloadUrl: $mirror, Hash: $hash}]')
 
-          # RequiredRuntimes is curated policy that changes without a rebuild, so it carries over from the channel's
-          # existing entry instead of being restated here.
+          # RequiredRuntimes and LinuxCompatible are curated policy that changes without a rebuild, so they carry over
+          # from the channel's existing entry instead of being restated here.
           jq \
             --arg channel "$CHANNEL" \
             --arg clientVersion "$CLIENT_VERSION" \
@@ -326,6 +326,7 @@ jobs:
                 ClientVersion: $clientVersion,
                 RuntimeFolderName: $runtimeFolder,
                 RequiredRuntimes: ($existing.RequiredRuntimes // []),
+                LinuxCompatible: ($existing.LinuxCompatible // false),
                 Mirrors: $mirrors
               } as $entry
             | {
