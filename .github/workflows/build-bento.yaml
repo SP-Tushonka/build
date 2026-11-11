@@ -243,11 +243,21 @@ jobs:
         env:
           SFTP_PRIVATE_KEY: ${{ secrets.SFTP_PRIVATE_KEY }}
           SFTP_KNOWN_HOSTS: ${{ secrets.SFTP_KNOWN_HOSTS }}
+          # One mirror per line as "host web-root public-base name". Names must match the patch manifest's mirror names.
+          SFTP_MIRRORS: ${{ vars.SFTP_MIRRORS }}
         run: |
           set -euo pipefail
 
           SSH_DIR="$RUNNER_TEMP/ssh"
           install -d -m 700 "$SSH_DIR"
+
+          if [ -z "${SFTP_MIRRORS:-}" ]; then
+            echo "::error::SFTP_MIRRORS is not set."
+            exit 1
+          fi
+          printf '%s\n' "$SFTP_MIRRORS" | sed '/^[[:space:]]*$/d' > "$SSH_DIR/mirrors"
+          echo "Mirrors:"
+          cat "$SSH_DIR/mirrors"
 
           if [ -z "${SFTP_PRIVATE_KEY:-}" ]; then
             echo "::error::SFTP_PRIVATE_KEY is not set."
@@ -268,6 +278,7 @@ jobs:
           fi
 
           echo "ssh_dir=$SSH_DIR" >> "$GITHUB_OUTPUT"
+          echo "mirrors=$SSH_DIR/mirrors" >> "$GITHUB_OUTPUT"
 
       - name: Build Release Manifest
         # Merges this build into the live release.json rather than replacing it. The installer keys one entry per
@@ -282,19 +293,32 @@ jobs:
           FILE_HASH: ${{ steps.manifest.outputs.file_hash }}
           BUILD_NAME: ${{ steps.manifest.outputs.build_name }}
           PRIMARY_BASE: ${{ secrets.RELEASE_PRIMARY_BASE }}
-          MIRROR_BASE: ${{ secrets.RELEASE_MIRROR_BASE }}
+          MIRRORS_FILE: ${{ steps.ssh.outputs.mirrors }}
         shell: bash
         run: |
           set -euo pipefail
 
+          mapfile -t MIRROR_LINES < "$MIRRORS_FILE"
+
           # Read the live file before touching anything. Publishing a fresh single-entry file would silently drop
           # every other channel, so a fetch failure has to stop the release rather than fall back to an empty list.
-          if ! curl -fsSL --retry 3 "${PRIMARY_BASE}/release.json" -o current.json; then
-            echo "::warning::Could not read release.json from the primary host, trying the mirror."
-            if ! curl -fsSL --retry 3 "${MIRROR_BASE}/release.json" -o current.json; then
-              echo "::error::Could not read the live release.json from either host. Refusing to publish, as writing a new file here would drop the other release channels."
-              exit 1
-            fi
+          FETCHED=false
+          if curl -fsSL --retry 3 "${PRIMARY_BASE}/release.json" -o current.json; then
+            FETCHED=true
+          else
+            echo "::warning::Could not read release.json from the primary host, trying the mirrors."
+            for LINE in "${MIRROR_LINES[@]}"; do
+              read -r _ _ BASE _ <<< "$LINE"
+              if curl -fsSL --retry 3 "${BASE}/release.json" -o current.json; then
+                FETCHED=true
+                break
+              fi
+            done
+          fi
+
+          if [ "$FETCHED" != true ]; then
+            echo "::error::Could not read the live release.json from any host. Refusing to publish, as writing a new file here would drop the other release channels."
+            exit 1
           fi
 
           if ! jq -e '.Releases | type == "array"' current.json > /dev/null; then
@@ -305,11 +329,13 @@ jobs:
           BEFORE=$(jq '.Releases | length' current.json)
           echo "Live release.json holds $BEFORE channel(s): $(jq -r '[.Releases[].SPTVersion] | join(", ")' current.json)"
 
-          MIRRORS=$(jq -n \
-            --arg main "${PRIMARY_BASE}/releases/${BUILD_NAME}" \
-            --arg mirror "${MIRROR_BASE}/releases/${BUILD_NAME}" \
-            --arg hash "$FILE_HASH" \
-            '[{Name: "Main", DownloadUrl: $main, Hash: $hash}, {Name: "Mirror", DownloadUrl: $mirror, Hash: $hash}]')
+          MIRRORS=$(jq -n --arg main "${PRIMARY_BASE}/releases/${BUILD_NAME}" --arg hash "$FILE_HASH" \
+            '[{Name: "Main", DownloadUrl: $main, Hash: $hash}]')
+          for LINE in "${MIRROR_LINES[@]}"; do
+            read -r _ _ BASE NAME <<< "$LINE"
+            MIRRORS=$(jq --arg name "$NAME" --arg url "${BASE}/releases/${BUILD_NAME}" --arg hash "$FILE_HASH" \
+              '. + [{Name: $name, DownloadUrl: $url, Hash: $hash}]' <<< "$MIRRORS")
+          done
 
           # RequiredRuntimes and LinuxCompatible are curated policy that changes without a rebuild, so they carry over
           # from the channel's existing entry instead of being restated here.
@@ -357,8 +383,8 @@ jobs:
         # semver tag produces 'RELEASE' and runs this step, WHICH PUSHES THE NEW BUILD TO THE LIVE INSTALLER. Bleeding
         # edge and debug builds never match and are unaffected.
         #
-        # Both hosts are written independently, archives first, so release.json never points at a file that is not
-        # there yet. Stale archives for this channel are pruned last, once the new entry is live.
+        # Archives go to every host before any release.json does, so release.json never points at a missing file.
+        # R2 gets release.json last because installers read it first. Stale archives are pruned once the entry is live.
         if: steps.manifest.outputs.build_type == 'RELEASE'
         working-directory: ${{ steps.bento.outputs.output_dir }}
         env:
@@ -368,15 +394,16 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
           SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
-          SFTP_RELEASE_PATH: ${{ secrets.SFTP_RELEASE_PATH }}
           SSH_DIR: ${{ steps.ssh.outputs.ssh_dir }}
           HOST_CHECK: ${{ steps.ssh.outputs.host_check }}
+          MIRRORS_FILE: ${{ steps.ssh.outputs.mirrors }}
         shell: bash
         run: |
           set -euo pipefail
+
+          mapfile -t MIRROR_LINES < "$MIRRORS_FILE"
 
           echo '[r2]
           type = s3
@@ -399,14 +426,20 @@ jobs:
           echo "== Uploading archive to R2 =="
           rclone copy "./${BUILD_NAME}" "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf -vv
 
-          echo "== Uploading archive to the VPS mirror =="
-          scp "${ssh_opts[@]}" "./${BUILD_NAME}" \
-            "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/releases/"
+          for LINE in "${MIRROR_LINES[@]}"; do
+            read -r HOST ROOT _ NAME <<< "$LINE"
+            echo "== Uploading archive to ${NAME} =="
+            scp "${ssh_opts[@]}" "./${BUILD_NAME}" "${SFTP_USERNAME}@${HOST}:${ROOT}/releases/" < /dev/null
+          done
 
-          echo "== Publishing release.json to both hosts =="
+          for LINE in "${MIRROR_LINES[@]}"; do
+            read -r HOST ROOT _ NAME <<< "$LINE"
+            echo "== Publishing release.json to ${NAME} =="
+            scp "${ssh_opts[@]}" "./release.json" "${SFTP_USERNAME}@${HOST}:${ROOT}/release.json" < /dev/null
+          done
+
+          echo "== Publishing release.json to R2 =="
           rclone copy "./release.json" "r2:${R2_BUCKET_NAME}/" --config ./rclone.conf -vv
-          scp "${ssh_opts[@]}" "./release.json" \
-            "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/release.json"
 
           echo "== Pruning superseded ${CHANNEL} archives =="
           rclone lsf "r2:${R2_BUCKET_NAME}/releases/" --config ./rclone.conf --files-only --include "SPT-${CHANNEL}.*.7z" \
@@ -419,10 +452,21 @@ jobs:
             echo "Nothing stale in R2."
           fi
 
-          ssh "${ssh_opts[@]}" "${SFTP_USERNAME}@${SFTP_HOST}" \
-            "find '${SFTP_RELEASE_PATH}/releases' -maxdepth 1 -name 'SPT-${CHANNEL}.*.7z' ! -name '${BUILD_NAME}' -print -delete"
+          # Over SFTP rather than a remote shell, since upload accounts may be limited to SFTP
+          for LINE in "${MIRROR_LINES[@]}"; do
+            read -r HOST ROOT _ NAME <<< "$LINE"
+            sftp -q "${ssh_opts[@]}" -b - "${SFTP_USERNAME}@${HOST}" <<< "ls -1 ${ROOT}/releases" \
+              | sed 's#^.*/##' | grep -F "SPT-${CHANNEL}." | grep '\.7z$' | grep -vFx "${BUILD_NAME}" > stale.txt || true
+            if [ -s stale.txt ]; then
+              echo "Removing from ${NAME}:"
+              cat stale.txt
+              sed "s#^#rm ${ROOT}/releases/#" stale.txt | sftp -q "${ssh_opts[@]}" -b - "${SFTP_USERNAME}@${HOST}"
+            else
+              echo "Nothing stale on ${NAME}."
+            fi
+          done
 
-          echo "Release published to both hosts."
+          echo "Release published to every host."
 
       - name: Upload Release to HTTPS Source
         id: upload-https-7z
@@ -430,26 +474,41 @@ jobs:
         shell: bash
         env:
           BUILD_NAME: ${{ steps.manifest.outputs.build_name }}
-          SFTP_HOST: ${{ secrets.SFTP_HOST }}
           SFTP_PORT: ${{ secrets.SFTP_PORT }}
           SFTP_USERNAME: ${{ secrets.SFTP_USERNAME }}
-          SFTP_RELEASE_PATH: ${{ secrets.SFTP_RELEASE_PATH }}
-          MIRROR_BASE: ${{ secrets.RELEASE_MIRROR_BASE }}
           SSH_DIR: ${{ steps.ssh.outputs.ssh_dir }}
           HOST_CHECK: ${{ steps.ssh.outputs.host_check }}
+          MIRRORS_FILE: ${{ steps.ssh.outputs.mirrors }}
         run: |
           set -euo pipefail
-          scp -v \
-            -i "$SSH_DIR/id_release" \
-            -o "IdentitiesOnly=yes" \
-            -o "UserKnownHostsFile=$SSH_DIR/known_hosts" \
-            -o "StrictHostKeyChecking=$HOST_CHECK" \
-            -o "Port=${SFTP_PORT}" \
-            -o "ConnectTimeout=20" \
-            "$BUILD_NAME" "${SFTP_USERNAME}@${SFTP_HOST}:${SFTP_RELEASE_PATH}/builds/"
 
-          echo "link_https=${MIRROR_BASE}/builds/${BUILD_NAME}" >> $GITHUB_OUTPUT
-          echo "HTTPS Upload completed: ${MIRROR_BASE}/builds/${BUILD_NAME}"
+          mapfile -t MIRROR_LINES < "$MIRRORS_FILE"
+
+          LINKS=()
+
+          for LINE in "${MIRROR_LINES[@]}"; do
+            read -r HOST ROOT BASE NAME <<< "$LINE"
+            echo "== Uploading build to ${NAME} =="
+            scp -v \
+              -i "$SSH_DIR/id_release" \
+              -o "IdentitiesOnly=yes" \
+              -o "UserKnownHostsFile=$SSH_DIR/known_hosts" \
+              -o "StrictHostKeyChecking=$HOST_CHECK" \
+              -o "Port=${SFTP_PORT}" \
+              -o "ConnectTimeout=20" \
+              "$BUILD_NAME" "${SFTP_USERNAME}@${HOST}:${ROOT}/builds/" < /dev/null
+
+            LINKS+=("${NAME}: ${BASE}/builds/${BUILD_NAME}")
+          done
+
+          {
+            echo "link_https<<LINKS_END"
+            printf '%s\n' "${LINKS[@]}"
+            echo "LINKS_END"
+          } >> $GITHUB_OUTPUT
+
+          echo "HTTPS Upload completed:"
+          printf '%s\n' "${LINKS[@]}"
 
       - name: Post Build Info to Discord
         env:
@@ -491,9 +550,10 @@ jobs:
             {"name": "Build Type", "value": "'"$BUILD_TYPE"'", "inline": true},
             {"name": "Mods", "value": "'"$MODS"'", "inline": true},
             {"name": "File Size", "value": "'"$FILE_SIZE_MB"'", "inline": true},
-            {"name": "File Hash", "value": "'"$FILE_HASH"'"},
-            {"name": "Download", "value": "'"$LINK_HTTPS"'"}
+            {"name": "File Hash", "value": "'"$FILE_HASH"'"}
           ]'
+
+          fields_json=$(jq --arg links "$LINK_HTTPS" '. + [{"name": "Download", "value": $links}]' <<< "$fields_json")
 
           payload=$(jq -n \
             --argjson fields "$fields_json" \
