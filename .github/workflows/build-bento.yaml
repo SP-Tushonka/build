@@ -255,7 +255,8 @@ jobs:
             echo "::error::SFTP_MIRRORS is not set."
             exit 1
           fi
-          printf '%s\n' "$SFTP_MIRRORS" | sed '/^[[:space:]]*$/d' > "$SSH_DIR/mirrors"
+          # Variables edited in the browser are saved with CRLF line endings
+          printf '%s\n' "$SFTP_MIRRORS" | tr -d '\r' | sed '/^[[:space:]]*$/d' > "$SSH_DIR/mirrors"
           echo "Mirrors:"
           cat "$SSH_DIR/mirrors"
 
