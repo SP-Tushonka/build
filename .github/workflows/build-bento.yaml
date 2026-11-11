@@ -244,6 +244,7 @@ jobs:
           SFTP_PRIVATE_KEY: ${{ secrets.SFTP_PRIVATE_KEY }}
           SFTP_KNOWN_HOSTS: ${{ secrets.SFTP_KNOWN_HOSTS }}
           # One mirror per line as "host web-root public-base name". Names must match the patch manifest's mirror names.
+          # A line without a name is uploaded to but not listed, for a host only reached through a redirect.
           SFTP_MIRRORS: ${{ vars.SFTP_MIRRORS }}
         run: |
           set -euo pipefail
@@ -334,6 +335,7 @@ jobs:
             '[{Name: "Main", DownloadUrl: $main, Hash: $hash}]')
           for LINE in "${MIRROR_LINES[@]}"; do
             read -r _ _ BASE NAME <<< "$LINE"
+            [ -n "$NAME" ] || continue
             MIRRORS=$(jq --arg name "$NAME" --arg url "${BASE}/releases/${BUILD_NAME}" --arg hash "$FILE_HASH" \
               '. + [{Name: $name, DownloadUrl: $url, Hash: $hash}]' <<< "$MIRRORS")
           done
@@ -429,13 +431,13 @@ jobs:
 
           for LINE in "${MIRROR_LINES[@]}"; do
             read -r HOST ROOT _ NAME <<< "$LINE"
-            echo "== Uploading archive to ${NAME} =="
+            echo "== Uploading archive to ${HOST} =="
             scp "${ssh_opts[@]}" "./${BUILD_NAME}" "${SFTP_USERNAME}@${HOST}:${ROOT}/releases/" < /dev/null
           done
 
           for LINE in "${MIRROR_LINES[@]}"; do
             read -r HOST ROOT _ NAME <<< "$LINE"
-            echo "== Publishing release.json to ${NAME} =="
+            echo "== Publishing release.json to ${HOST} =="
             scp "${ssh_opts[@]}" "./release.json" "${SFTP_USERNAME}@${HOST}:${ROOT}/release.json" < /dev/null
           done
 
@@ -459,11 +461,11 @@ jobs:
             sftp -q "${ssh_opts[@]}" -b - "${SFTP_USERNAME}@${HOST}" <<< "ls -1 ${ROOT}/releases" \
               | sed 's#^.*/##' | grep -F "SPT-${CHANNEL}." | grep '\.7z$' | grep -vFx "${BUILD_NAME}" > stale.txt || true
             if [ -s stale.txt ]; then
-              echo "Removing from ${NAME}:"
+              echo "Removing from ${HOST}:"
               cat stale.txt
               sed "s#^#rm ${ROOT}/releases/#" stale.txt | sftp -q "${ssh_opts[@]}" -b - "${SFTP_USERNAME}@${HOST}"
             else
-              echo "Nothing stale on ${NAME}."
+              echo "Nothing stale on ${HOST}."
             fi
           done
 
@@ -489,7 +491,7 @@ jobs:
 
           for LINE in "${MIRROR_LINES[@]}"; do
             read -r HOST ROOT BASE NAME <<< "$LINE"
-            echo "== Uploading build to ${NAME} =="
+            echo "== Uploading build to ${HOST} =="
             scp -v \
               -i "$SSH_DIR/id_release" \
               -o "IdentitiesOnly=yes" \
@@ -499,7 +501,9 @@ jobs:
               -o "ConnectTimeout=20" \
               "$BUILD_NAME" "${SFTP_USERNAME}@${HOST}:${ROOT}/builds/" < /dev/null
 
-            LINKS+=("${NAME}: ${BASE}/builds/${BUILD_NAME}")
+            if [ -n "$NAME" ]; then
+              LINKS+=("${NAME}: ${BASE}/builds/${BUILD_NAME}")
+            fi
           done
 
           {
