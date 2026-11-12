@@ -340,13 +340,15 @@ jobs:
               '. + [{Name: $name, DownloadUrl: $url, Hash: $hash}]' <<< "$MIRRORS")
           done
 
-          # RequiredRuntimes, LinuxCompatible and Legacy are curated policy that changes without a rebuild, so they carry over
-          # from the channel's existing entry instead of being restated here. A channel with no Legacy set is legacy when it is 3.x.
+          # RequiredRuntimes, LinuxCompatible and Legacy are curated policy that carries over from the channel's existing entry.
+          # A 3.x channel without them is legacy and needs only .NET 8 for its launcher, as the client's 4.7.2 is always checked.
+          LEGACY_RUNTIMES='[{"DisplayName": ".Net 8 Runtime", "Identifier": "Microsoft.NETCore.App", "MinimumVersion": "8.0.0", "DownloadUrl": "https://dotnet.microsoft.com/en-us/download/dotnet/thank-you/runtime-8.0.0-windows-x64-installer"}]'
           jq \
             --arg channel "$CHANNEL" \
             --arg clientVersion "$CLIENT_VERSION" \
             --arg runtimeFolder "$RUNTIME_FOLDER" \
             --argjson mirrors "$MIRRORS" \
+            --argjson legacyRuntimes "$LEGACY_RUNTIMES" \
             '
             .Releases as $releases
             | ($releases | map(select(.SPTVersion == $channel)) | first) as $existing
@@ -354,7 +356,11 @@ jobs:
                 SPTVersion: $channel,
                 ClientVersion: $clientVersion,
                 RuntimeFolderName: $runtimeFolder,
-                RequiredRuntimes: ($existing.RequiredRuntimes // []),
+                RequiredRuntimes: (
+                  if ($existing.RequiredRuntimes // []) | length > 0 then $existing.RequiredRuntimes
+                  elif $channel | startswith("3.") then $legacyRuntimes
+                  else [] end
+                ),
                 LinuxCompatible: ($existing.LinuxCompatible // false),
                 Legacy: (if ($existing // {}) | has("Legacy") then $existing.Legacy else ($channel | startswith("3.")) end),
                 Mirrors: $mirrors
@@ -365,6 +371,8 @@ jobs:
                   then ($releases | map(if .SPTVersion == $channel then $entry else . end))
                   else ([$entry] + $releases)
                   end
+                  # Newest first, since the installer preselects the first entry
+                  | sort_by(.SPTVersion | split(".") | map(tonumber)) | reverse
                 )
               }
             ' current.json > release.json
@@ -375,7 +383,7 @@ jobs:
           fi
 
           if [ "$(jq --arg c "$CHANNEL" '.Releases[] | select(.SPTVersion == $c) | .RequiredRuntimes | length' release.json)" -eq 0 ]; then
-            echo "::error::Channel ${CHANNEL} has no RequiredRuntimes. A new channel needs its runtime requirements seeded in the live release.json before the first automated publish."
+            echo "::error::Channel ${CHANNEL} has no RequiredRuntimes. A new 4.x or later channel needs its runtime requirements seeded in the live release.json before the first automated publish."
             exit 1
           fi
 
