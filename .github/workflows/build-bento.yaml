@@ -340,8 +340,8 @@ jobs:
               '. + [{Name: $name, DownloadUrl: $url, Hash: $hash}]' <<< "$MIRRORS")
           done
 
-          # RequiredRuntimes and LinuxCompatible are curated policy that changes without a rebuild, so they carry over
-          # from the channel's existing entry instead of being restated here.
+          # RequiredRuntimes, LinuxCompatible and Legacy are curated policy that changes without a rebuild, so they carry over
+          # from the channel's existing entry instead of being restated here. A channel with no Legacy set is legacy when it is 3.x.
           jq \
             --arg channel "$CHANNEL" \
             --arg clientVersion "$CLIENT_VERSION" \
@@ -356,6 +356,7 @@ jobs:
                 RuntimeFolderName: $runtimeFolder,
                 RequiredRuntimes: ($existing.RequiredRuntimes // []),
                 LinuxCompatible: ($existing.LinuxCompatible // false),
+                Legacy: (if ($existing // {}) | has("Legacy") then $existing.Legacy else ($channel | startswith("3.")) end),
                 Mirrors: $mirrors
               } as $entry
             | {
